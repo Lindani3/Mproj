@@ -1,0 +1,360 @@
+"""
+b8_dv01_profile.py
+==================
+Per-date DV01 R² evaluation for v2/v22 profile surrogate models.
+
+For each test sample (X_disc, X_scalar) the script computes:
+
+  DV01_surr(t_k) = ŷ_k(P+, a, σ) − ŷ_k(P, a, σ)
+  DV01_ref(t_k)  = E^Q[V(t_k; P+, a, σ)] − E^Q[V(t_k; P, a, σ)]
+
+where P+ is a one-basis-point parallel upward shift:
+  P+(0, T_j) = P(0, T_j) · exp(−0.0001 · T_j)
+
+Key convention
+--------------
+The contractual fixed rate K is taken from the BASE curve only and held
+fixed across the bump.  This is the textbook DV01 convention.  Recomputing
+K on the bumped curve would cancel the first-order sensitivity against the
+annuity and leave only a second-order residue (this was the source of the
+previously observed R² ≈ −33).
+
+The reference DV01 is computed analytically via the MGF of r_{t_k} ~ N(μ_k, s_k²)
+using only the stored X_disc array — no Svensson parameter file is required.
+
+Forward rates are approximated from X_disc by central finite differences:
+  f(0, t_k) ≈ −(ln P(0, t_k + τ) − ln P(0, t_k − τ)) / (2τ)
+with one-sided differences at the k=1 boundary.
+
+For model 2 (EPE surrogate), the same analytical swap-value DV01 reference
+is used.  This tests whether the EPE surrogate recovers yield-curve sensitivity
+of the underlying swap even though it was not trained on price labels.
+
+Output CSV columns: time, n, R2_DV01
+  — same format as b6_r2_profile_v2.py output.
+
+Usage
+-----
+  python b8_dv01_profile.py \\
+      --checkpoint  data/best_model_1a_v22.pt \\
+      --data        data/train_1a_v22.h5 \\
+      --label       1a_v22 \\
+      --out_dir     data/r2
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+import h5py
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hw_utils import T_MONITOR, T_PAY, TAU
+
+CODE_DIR  = os.path.dirname(os.path.abspath(__file__))
+BUMP_BPS  = 0.0001   # 1 basis point parallel yield shift
+N_MON     = len(T_MONITOR)   # 21
+A_FLOOR   = 1e-4     # guard against catastrophic cancellation as a -> 0
+
+# Sanity: the central finite-difference for f(0,t_k) is only centred on t_k
+# if the monitoring grid (minus its t=0 boundary) equals the payment grid.
+assert np.allclose(T_MONITOR[1:], T_PAY), (
+    "T_MONITOR[1:] and T_PAY must be identical "
+    "for the central-difference forward rate to be centred on t_k."
+)
+
+
+# ---------------------------------------------------------------------------
+# Analytical reference DV01 from stored discount factor array
+# ---------------------------------------------------------------------------
+
+def _ref_profile_from_disc(
+    X_disc:   np.ndarray,   # (N, 20)  P(0, T_j)
+    X_scalar: np.ndarray,   # (N, 2)   [a, sigma]
+    bump:     float = 0.0,  # 0.0 for base, BUMP_BPS for shifted curve
+    K_par:    np.ndarray | None = None,   # (N,) contractual fixed rate
+) -> np.ndarray:
+    """
+    Compute E^Q[V(t_k; P_bump, a, σ)] for all samples and monitoring dates.
+
+    Parameters
+    ----------
+    X_disc   : (N, 20) base discount factors
+    X_scalar : (N,  2) [a, sigma] per sample
+    bump     : parallel shift added to zero yields (0 = base, 0.0001 = +1bp)
+    K_par    : (N,) contractual fixed rate.  If None, computed from the BASE
+               curve.  Must be passed identically for the base and bumped
+               calls — that is the whole point of DV01.
+
+    Returns
+    -------
+    V_ref : (N, 21) float64  — zero at boundary dates t_0=0 and t_20=10
+    """
+    N       = X_disc.shape[0]
+    a_raw   = X_scalar[:, 0].astype(np.float64)   # (N,)
+    sig_arr = X_scalar[:, 1].astype(np.float64)   # (N,)
+
+    # Guard the a -> 0 limit; both mu and B have 1/a and 1/a^2 factors.
+    a_arr = np.clip(a_raw, A_FLOOR, None)
+
+    # Contractual fixed rate: from the BASE curve ONLY, held fixed across
+    # the bump.  This is what makes the quantity a DV01 rather than the
+    # sensitivity of a par-swap value function.
+    if K_par is None:
+        K_par = (1.0 - X_disc[:, -1]) / (TAU * X_disc.sum(axis=1))   # (N,)
+
+    # Bumped discount curve: only used for discounting and forward rates.
+    if bump == 0.0:
+        disc = X_disc.astype(np.float64)
+    else:
+        disc = X_disc.astype(np.float64) * np.exp(-bump * T_PAY[np.newaxis, :])
+
+    # Log-discount for forward rate approximation (always from BASE X_disc)
+    log_base = np.log(X_disc.astype(np.float64))   # (N, 20)
+
+    V_ref = np.zeros((N, N_MON), dtype=np.float64)
+
+    for k in range(1, 20):     # interior monitoring dates only
+        t_k = float(T_MONITOR[k])
+
+        # --- forward rate f(0, t_k) from base log-discounts ---------------
+        if k == 1:
+            f0t = -(log_base[:, 1] - log_base[:, 0]) / TAU
+        else:
+            f0t = -(log_base[:, k] - log_base[:, k - 2]) / (2.0 * TAU)
+        f0t_bump = f0t + bump   # shifted forward rate
+
+        # --- r_{t_k} distribution parameters --------------------------------
+        ea  = np.exp(-a_arr * t_k)
+        e2a = np.exp(-2.0 * a_arr * t_k)
+
+        s2  = (sig_arr**2 / (2.0 * a_arr)) * (1.0 - e2a)            # (N,)
+        mu  = f0t_bump + (sig_arr**2 / (2.0 * a_arr**2)) * (1.0 - ea)**2
+
+        # --- remaining payment dates T_j > t_k ------------------------------
+        rem_mask = T_PAY > t_k + 1e-9
+        T_rem    = T_PAY[rem_mask]          # (n_rem,)
+        disc_rem = disc[:, rem_mask]        # (N, n_rem)
+        disc_t   = disc[:, k - 1]          # (N,)  P+(0, t_k)
+
+        # B(t_k, T_j): (N, n_rem)
+        B = ((1.0 - np.exp(-a_arr[:, None] * (T_rem[None, :] - t_k)))
+             / a_arr[:, None])
+
+        # ln A(t_k, T_j)
+        lnA = (np.log(disc_rem / disc_t[:, None])
+               + B * f0t_bump[:, None]
+               - (sig_arr[:, None]**2 / (4.0 * a_arr[:, None]))
+               * B**2 * (1.0 - e2a[:, None]))
+
+        # E^Q[P(t_k, T_j)]
+        E_P = np.exp(lnA - B * mu[:, None] + 0.5 * B**2 * s2[:, None])
+
+        # E^Q[V(t_k)] — pay-fixed perspective, K held fixed at K_par.
+        V_ref[:, k] = (1.0 - E_P[:, -1]) - K_par * TAU * E_P.sum(axis=1)
+
+    return V_ref
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Per-date DV01 R² for profile models")
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--data",       type=str, required=True)
+    p.add_argument("--label",      type=str, default="model")
+    p.add_argument("--batch_size", type=int, default=4096)
+    p.add_argument("--device",     type=str, default="cpu",
+                   choices=["cpu", "cuda"])
+    p.add_argument("--out_dir",    type=str,
+                   default=os.path.join(CODE_DIR, "data"))
+    return p.parse_args()
+
+
+def main():
+    import torch
+    from c4_model_v2 import IRSSurrogateV2
+
+    args = parse_args()
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------ model
+    print(f"\nLoading checkpoint: {args.checkpoint}")
+    ckpt  = torch.load(args.checkpoint, map_location="cpu")
+    model = IRSSurrogateV2(
+        n_yields   = ckpt.get("n_yields",   20),
+        n_scalar   = ckpt.get("n_scalar",    2),
+        n_out      = ckpt.get("n_out",      21),
+        hidden_dim = ckpt.get("hidden_dim", 128),
+        n_layers   = ckpt.get("n_layers",    2),
+    )
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    device     = torch.device(args.device)
+    model.to(device)
+    norm_stats = ckpt.get("norm_stats", None)
+    print(f"  Epoch {ckpt['epoch']},  val MSE {ckpt['val_loss']:.6f}")
+    if norm_stats is not None:
+        print("  Normalisation stats found (Sobolev model).")
+
+    # ------------------------------------------------------------------ data
+    print(f"Loading data: {args.data}")
+    with h5py.File(args.data, "r") as hf:
+        X_disc   = hf["X_disc"][:].astype(np.float32)    # (N, 20)
+        X_scalar = hf["X_scalar"][:].astype(np.float32)  # (N,  2)
+    N = X_disc.shape[0]
+    print(f"  {N:,} samples")
+
+    # ------------------------------------------------------------------ bump
+    T_PAY_f32    = T_PAY.astype(np.float32)
+    X_disc_up    = X_disc * np.exp(-BUMP_BPS * T_PAY_f32[np.newaxis, :])   # (N,20)
+
+    # Contractual fixed rate: from BASE curve, used for both base and bumped
+    # reference valuations.  (This is the bug fix.)
+    K_par = (1.0 - X_disc[:, -1].astype(np.float64)) / (
+        TAU * X_disc.astype(np.float64).sum(axis=1)
+    )
+
+    # ------------------------------------------------------------------ surrogate forward passes
+    xs_t = torch.from_numpy(X_scalar)  # hoisted
+
+    def _forward(disc_np: np.ndarray) -> np.ndarray:
+        """Run model on (N,20) disc array; return (N,21) float64 predictions."""
+        disc_t = torch.from_numpy(disc_np)  # (N, 20) float32
+
+        if norm_stats is not None:
+            xd_mean = norm_stats['xd_mean']
+            xd_std  = norm_stats['xd_std']
+            xs_mean = norm_stats['xs_mean']
+            xs_std  = norm_stats['xs_std']
+            y_mean  = norm_stats['y_mean'].numpy()
+            y_std   = norm_stats['y_std'].numpy()
+            disc_n  = (disc_t - xd_mean) / xd_std
+            xs_n    = (xs_t - xs_mean) / xs_std
+        else:
+            disc_n = disc_t
+            xs_n   = xs_t
+            y_mean, y_std = 0.0, 1.0
+
+        preds = np.empty((N, 21), dtype=np.float64)
+        bs    = args.batch_size
+        with torch.no_grad():
+            for i in range(0, N, bs):
+                xd  = disc_n[i:i+bs].unsqueeze(-1).to(device)
+                xs  = xs_n[i:i+bs].to(device)
+                out = model(xd, xs).cpu().numpy().astype(np.float64)
+                preds[i:i+bs] = out
+
+        if norm_stats is not None:
+            preds = preds * y_std + y_mean
+        return preds
+
+    print("Forward pass — base curve ...")
+    y_base = _forward(X_disc)
+
+    print("Forward pass — bumped curve (+1bp) ...")
+    y_up   = _forward(X_disc_up)
+
+    DV01_surr = y_up - y_base    # (N, 21)
+
+    interior_idx = list(range(1, 20))
+
+    # ------------------------------------------------------------------ analytical reference DV01
+    print("Computing analytical reference DV01 ...")
+    V_base    = _ref_profile_from_disc(X_disc, X_scalar, bump=0.0,        K_par=K_par)
+    V_up      = _ref_profile_from_disc(X_disc, X_scalar, bump=BUMP_BPS,   K_par=K_par)
+    DV01_ref  = V_up - V_base    # (N, 21)
+
+    ref_rms  = float(np.sqrt(np.mean(DV01_ref[:, interior_idx]**2)))
+    surr_rms = float(np.sqrt(np.mean(DV01_surr[:, interior_idx]**2)))
+    print(f"\n  DV01_ref  RMS (interior dates): {ref_rms:.6e}")
+    print(f"  DV01_surr RMS (interior dates): {surr_rms:.6e}")
+    print(f"  Scale ratio (surr/ref):         {surr_rms / (ref_rms + 1e-30):.4f}")
+
+    # Sign-convention sanity check on an interior date.
+    k_check = 10
+    sgn_ref  = np.sign(np.mean(DV01_ref[:, k_check]))
+    sgn_surr = np.sign(np.mean(DV01_surr[:, k_check]))
+    print(f"  Sign check @ t={T_MONITOR[k_check]:.1f}: "
+          f"ref={sgn_ref:+.0f}  surr={sgn_surr:+.0f}"
+          + ("  <-- WARNING: opposite sign conventions"
+             if sgn_ref * sgn_surr < 0 else ""))
+    print(f"  corr(DV01_ref, DV01_surr) @ t={T_MONITOR[k_check]:.1f}: "
+          f"{np.corrcoef(DV01_ref[:, k_check], DV01_surr[:, k_check])[0,1]:+.4f}")
+
+    # -------------------------------------------------------------- bias-vs-signal diagnostic
+    # De-mean both series per date before computing R^2. If this recovers a
+    # much healthier R^2, the network carries a real but small per-curve
+    # signal that is being swamped by a systematic per-date offset (a
+    # near-constant bias, not curve-dependent), rather than having learned
+    # no sensitivity information at all.
+    print("\n  Bias-vs-signal diagnostic (de-meaned R^2 per date):")
+    print(f"  {'t_k':>5}  {'mean ref':>12}  {'mean surr':>12}  "
+          f"{'bias':>12}  {'R2 (raw)':>10}  {'R2 (demean)':>12}")
+    for k in interior_idx:
+        yt = DV01_ref[:, k]
+        yp = DV01_surr[:, k]
+        ss_res_raw = np.sum((yt - yp) ** 2)
+        ss_tot_raw = np.sum((yt - yt.mean()) ** 2)
+        r2_raw = 1.0 - ss_res_raw / ss_tot_raw if ss_tot_raw > 1e-20 else np.nan
+
+        yt_dm = yt - yt.mean()
+        yp_dm = yp - yp.mean()
+        ss_res_dm = np.sum((yt_dm - yp_dm) ** 2)
+        ss_tot_dm = np.sum(yt_dm ** 2)
+        r2_dm = 1.0 - ss_res_dm / ss_tot_dm if ss_tot_dm > 1e-20 else np.nan
+
+        print(f"  {T_MONITOR[k]:5.1f}  {yt.mean():12.4e}  {yp.mean():12.4e}  "
+              f"{yp.mean() - yt.mean():12.4e}  {r2_raw:10.4f}  {r2_dm:12.4f}")
+
+    # ------------------------------------------------------------------ R² and RMSE at each date
+    rows = []
+    t_last = float(T_MONITOR[-1])
+    for k, t_k in enumerate(T_MONITOR):
+        if t_k < 1e-8 or t_k >= t_last - 1e-8:
+            rows.append({"time": t_k, "n": N, "R2_DV01": np.nan, "RMSE_DV01": np.nan})
+            continue
+        yt = DV01_ref[:, k]
+        yp = DV01_surr[:, k]
+        ss_res = float(np.sum((yt - yp) ** 2))
+        ss_tot = float(np.sum((yt - yt.mean()) ** 2))
+        r2 = (1.0 - ss_res / ss_tot) if ss_tot > 1e-20 else np.nan
+        rmse = float(np.sqrt(ss_res / len(yt)))
+        rows.append({"time": t_k, "n": N, "R2_DV01": float(r2), "RMSE_DV01": rmse})
+
+    df       = pd.DataFrame(rows)
+    mean_r2  = float(np.nanmean(df["R2_DV01"]))
+    mean_rmse_of_dates = float(np.nanmean(df["RMSE_DV01"]))
+
+    # Pooled RMSE across all interior dates and samples together (a single
+    # headline number, distinct from the mean of per-date RMSEs above).
+    yt_pool = DV01_ref[:, interior_idx].flatten()
+    yp_pool = DV01_surr[:, interior_idx].flatten()
+    pooled_rmse = float(np.sqrt(np.mean((yt_pool - yp_pool) ** 2)))
+
+    hdr = f"{'time':>6}  {'n':>10}  {'R2_DV01':>12}  {'RMSE_DV01':>12}"
+    print()
+    print(hdr)
+    print("-" * len(hdr))
+    for _, row in df.iterrows():
+        r2_str   = f"{row['R2_DV01']:.6f}"   if not np.isnan(row["R2_DV01"])   else "         NaN"
+        rmse_str = f"{row['RMSE_DV01']:.6e}" if not np.isnan(row["RMSE_DV01"]) else "         NaN"
+        print(f"{row['time']:>6.1f}  {int(row['n']):>10,}  {r2_str:>12}  {rmse_str:>12}")
+    print("-" * len(hdr))
+    print(f"{'Mean DV01 R²':>20}  {mean_r2:.6f}")
+    print(f"{'Mean of per-date RMSE':>20}  {mean_rmse_of_dates:.6e}")
+    print(f"{'Pooled DV01 RMSE':>20}  {pooled_rmse:.6e}  ({pooled_rmse*10000:.4f} bps of notional)")
+
+    out = os.path.join(args.out_dir, f"dv01_profile_{args.label}.csv")
+    df.to_csv(out, index=False, float_format="%.6f")
+    print(f"\nSaved: {out}")
+
+
+if __name__ == "__main__":
+    main()

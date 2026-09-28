@@ -1,0 +1,147 @@
+RESULTS INVENTORY — Masters Dissertation
+=========================================
+"Valuation of Financial Derivatives under X-Value Adjustments using Deep Learning Techniques"
+Lindani Melusi Hlophe — MSc Computational and Applied Mathematics, Wits
+
+All scripts live in:  FinalResults/Code/
+All outputs saved to: Mproj/results/  (../../results/ relative to this folder)
+Python environment:   Mproj/.venv  (QuantLib 1.42.1 installed here)
+Run locally as:       cd FinalResults/Code && ../../.venv/bin/python <script>.py
+Spyder fix:           Tools > Preferences > Python interpreter >
+                      /home/lindani/Documents/Masters Research/Mproj/.venv/bin/python
+
+Sync to cluster:      rsync -avz "FinalResults/Code/" lhlophe@146.141.21.100:/home-mscluster/lhlophe/FinalResults/Code/
+Pull results back:    rsync -avz lhlophe@146.141.21.100:/home-mscluster/lhlophe/results/ "Mproj/results/"
+Cluster install:      pip install --user QuantLib matplotlib pandas scipy
+
+=========================================
+BLOCK 1: Yield Curve Calibration & Hull-White Setup
+— TRADITIONAL MODELS — run on cluster
+=========================================
+[WRITTEN] b1_yield_curves.py
+          Output : b1_yield_curves.png
+          Content: Five Svensson yield curves (normal, humped, flat, inverted, steep).
+          Data   : feds200628.csv
+          Status : Script written. Not yet run.
+
+[WRITTEN] b1_yield_discount.py
+          Output : b1_yield_discount.png
+          Content: Dual-axis — zero rate y(0,T) left axis, discount factor P(0,T) right axis.
+          Data   : feds200628.csv
+          Status : Script written. Not yet run.
+
+[WRITTEN] b1_hw_paths.py
+          Output : b1_hw_paths.png
+          Content: Five Hull-White short rate paths, one per (a, sigma) pair.
+          Data   : feds200628.csv
+          Status : Script written. Not yet run.
+                   NOTE: import os fixed (was missing after manual edit).
+
+=========================================
+BLOCK 2: IRS Valuation Under Hull-White
+— TRADITIONAL MODELS — run on cluster
+=========================================
+[WRITTEN] b2_par_rate_table.py
+          Output : b2_par_rate_table.csv  +  b2_par_rate_table.tex
+          Content: Par swap rates K^par for maturities {1,2,3,5,7,10}Y.
+          Data   : feds200628.csv
+          Status : Script written. Not yet run.
+
+[WRITTEN] b2_mc_convergence.py
+          Output : b2_mc_convergence.png
+          Content: EE(t=5Y) convergence vs N Monte Carlo paths.
+          Data   : feds200628.csv
+          Status : Script written. Not yet run. (N=50,000 reference — may be slow.)
+
+[WRITTEN] b2_cashflow_profile.py
+          Output : b2_cashflow_profile.png
+          Content: Fixed vs floating cashflow bar chart at each T_j = 0.5j.
+          Data   : feds200628.csv
+          Status : Script written. Not yet run.
+
+=========================================
+BLOCK 3: Expected Exposure & xVA
+— TRADITIONAL MODELS — run on cluster
+=========================================
+[WRITTEN] b3_exposure_profile.py
+          Output : b3_exposure_profile.png
+          Content: EPE and ENE profiles over 10Y IRS horizon (N=10,000 paths).
+          Data   : feds200628.csv
+          Status : Script written. Not yet run. (Computationally heavy — use cluster.)
+
+[WRITTEN] b3_ee_comparison.py
+          Output : b3_ee_comparison.png
+          Content: Jamshidian analytical EE vs Monte Carlo EE, diff in bps.
+          Data   : feds200628.csv  +  ee_comparison_results.csv (if available from cluster)
+          Status : Script written. Not yet run.
+                   PENDING: pull ee_comparison_results.csv from cluster first.
+
+=========================================
+BLOCK 4: Differential Deep Learning Surrogate
+— ML MODELS — run on cluster (training data and weights are on cluster)
+=========================================
+[WRITTEN] b4_training_history.py
+          Output : b4_training_history.png
+          Content: Train/val MSE vs epoch, Model 1a and 1b side by side (log scale).
+          Data   : checkpoints/model1a/history.csv
+                   checkpoints/model1b/history.csv
+          Status : Script written. Run on cluster.
+
+[WRITTEN] b4_surrogate_accuracy.py
+          Output : b4_surrogate_accuracy.png
+          Content: Predicted V_IRS vs analytical V_IRS scatter (test split), R² + RMSE.
+          Data   : model1a_dataset.csv (test split)
+                   checkpoints/model1a/best.pt
+          Status : Script written. Run on cluster.
+
+[WRITTEN] b4_greeks_accuracy.py
+          Output : b4_greeks_accuracy.png
+          Content: Surrogate DV01 Jacobian vs analytical DV01, per-tenor RMSE.
+          Data   : model1b_dataset.csv (test split)
+                   checkpoints/model1b/best.pt
+          Status : Script written. Run on cluster.
+
+[WRITTEN] b4_key_rate_dv01.py
+          Output : b4_key_rate_dv01.png
+          Content: Analytical key-rate DV01 bar chart via bump-and-reprice (scipy spline).
+          Data   : feds200628.csv
+          Status : Script written. TRADITIONAL — can run on cluster. No PyTorch needed.
+
+=========================================
+CLUSTER TASKS PENDING
+=========================================
+- Sync FinalResults/Code/ to cluster (rsync command above)
+- Install QuantLib on cluster: pip install --user QuantLib matplotlib pandas scipy
+- Run b1_*, b2_*, b3_*, b4_key_rate_dv01.py on cluster
+- Pull results back to Mproj/results/
+- Pull ee_comparison_results.csv from cluster into FinalResults/
+- Confirm experiment_flat.csv location on cluster
+- SSH login: lhlophe@146.141.21.100
+- Home dir on cluster: /home-mscluster/lhlophe/
+
+=========================================
+FILES TO SYNC TO CLUSTER
+=========================================
+Scripts (FinalResults/Code/):
+  All 12 .py scripts + feds200628.csv
+
+Training data and weights (from local mproj/):
+  mproj/checkpoints/model1a/history.csv
+  mproj/checkpoints/model1a/best.pt
+  mproj/checkpoints/model1b/history.csv
+  mproj/checkpoints/model1b/best.pt
+  mproj/model1a_dataset.csv
+  mproj/model1b_dataset.csv
+
+Cluster install:
+  pip install --user QuantLib matplotlib pandas scipy torch
+
+=========================================
+NOTES
+=========================================
+- QuantLib 1.42.1 installed in Mproj/.venv only (not system Python)
+- Day count: ql.Thirty360(ql.Thirty360.BondBasis) for fixed leg (30/360)
+- Calendar: ql.NullCalendar() — continuous-time model, no business day adjustments
+- Floating leg: single-curve (discount = forecast = Svensson zero curve)
+- Notional: N = 1 (all values per unit notional)
+- IRS: 10Y, semi-annual (tau = 0.5), 20 payment dates T_j = 0.5j, j=1..20
